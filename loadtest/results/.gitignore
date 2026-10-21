@@ -1,0 +1,4 @@
+# Run outputs stay local; reports chosen for the delivery go under samples/.
+/*
+!/.gitignore
+!/samples/

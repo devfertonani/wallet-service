@@ -1,0 +1,50 @@
+# Resource limits for the service under test, used on top of the load
+# override:
+#
+#   LIMITS=1 loadtest/run.sh steady
+#
+# Without limits every container can take the whole Docker VM, so the
+# MiniStack (one thread) saturates long before the wallet or Postgres feel
+# anything. Here the three instances and Postgres get a small, fixed share of
+# CPU and memory, close to a small production pod, so the bottleneck can move
+# to the service itself and memory pressure shows up as GC work, latency or an
+# OOM kill instead of staying invisible.
+#
+# Only the components that would run in production are capped. MiniStack and
+# Keycloak stand in for AWS and the identity provider and stay unlimited, and
+# the generator keeps its own cap (LOADGEN_CPUS).
+#
+# Swap is disabled for the capped containers (memswap_limit = mem_limit): a
+# container that needs more than its limit is OOM-killed, as in Kubernetes,
+# instead of slowing down on swap. run.sh reports OOM kills and restarts.
+#
+# Go 1.25+ derives GOMAXPROCS from the CPU limit; GOMEMLIMIT is set to ~85% of
+# the memory limit so the GC works harder before the kernel kills the process.
+
+x-wallet-limits: &wallet-limits
+  cpus: ${LIMIT_WALLET_CPUS:-0.25}
+  mem_limit: ${LIMIT_WALLET_MEM:-64m}
+  memswap_limit: ${LIMIT_WALLET_MEM:-64m}
+
+services:
+  wallet-1:
+    <<: *wallet-limits
+    environment:
+      GOMEMLIMIT: ${LIMIT_WALLET_GOMEMLIMIT:-54MiB}
+  wallet-2:
+    <<: *wallet-limits
+    environment:
+      GOMEMLIMIT: ${LIMIT_WALLET_GOMEMLIMIT:-54MiB}
+  wallet-3:
+    <<: *wallet-limits
+    environment:
+      GOMEMLIMIT: ${LIMIT_WALLET_GOMEMLIMIT:-54MiB}
+
+  # 512 MiB keeps the stock shared_buffers (128 MB) at the usual ~25% of the
+  # memory. With 256 MiB (50%) the load itself fits, but the full-database
+  # invariant queries of "loadgen verify" get a backend OOM-killed and the
+  # server goes through crash recovery.
+  postgres:
+    cpus: ${LIMIT_POSTGRES_CPUS:-0.5}
+    mem_limit: ${LIMIT_POSTGRES_MEM:-512m}
+    memswap_limit: ${LIMIT_POSTGRES_MEM:-512m}

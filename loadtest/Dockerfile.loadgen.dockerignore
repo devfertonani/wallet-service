@@ -1,0 +1,6 @@
+# Build context of Dockerfile.loadgen: only the module files and the
+# generator are copied, so keep results and VCS data out of the context.
+.git
+.analysis
+loadtest/results
+bin

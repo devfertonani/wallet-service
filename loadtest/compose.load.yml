@@ -1,0 +1,95 @@
+# Load test override, used together with the main file, from the repo root:
+#
+#   docker compose -f docker-compose.yml -f loadtest/compose.load.yml --profile load up -d
+#
+# loadtest/run.sh does this for you. It adds Prometheus, Grafana and the
+# Postgres exporter (profile "load"), the generator image (profile "loadgen",
+# only started by "docker compose run"), and turns on query statistics in
+# Postgres. Durability is NOT relaxed: fsync and synchronous_commit keep their
+# defaults (on), because a wallet benchmark without durable commits would
+# measure something that cannot run in production.
+
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=200ms
+      - -c
+      - max_wal_size=2GB
+
+  loadgen:
+    profiles: [loadgen]
+    build:
+      context: .
+      dockerfile: loadtest/Dockerfile.loadgen
+    image: wallet-service-loadgen:local
+    # Files in loadtest/results belong to the host user.
+    user: "${LOADGEN_UID:-1000}:${LOADGEN_GID:-1000}"
+    environment:
+      LOADGEN_TARGETS: http://wallet-1:8080,http://wallet-2:8080,http://wallet-3:8080
+      # Tokens are requested inside the network; the issuer stays
+      # http://localhost:8081/realms/wallet because Keycloak has a fixed hostname.
+      LOADGEN_TOKEN_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/token
+      LOADGEN_DATABASE_URL: postgres://wallet_owner:wallet_owner@postgres:5432/wallet?sslmode=disable
+      LOADGEN_METRICS_ADDR: ":9100"
+      AWS_ENDPOINT_URL: http://ministack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: "000000000000"
+      AWS_SECRET_ACCESS_KEY: test
+    volumes:
+      - ./loadtest/results:/results
+    # The generator shares the host with what it measures; a CPU cap keeps it
+    # from starving the service (raise LOADGEN_CPUS for higher rates).
+    cpus: ${LOADGEN_CPUS:-2}
+    mem_limit: 1g
+
+  prometheus:
+    profiles: [load]
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    volumes:
+      - ./loadtest/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports: ["127.0.0.1:${LOAD_PROMETHEUS_PORT:-9090}:9090"]
+
+  grafana:
+    profiles: [load]
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Read-only anonymous access, bound to localhost only.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/wallet-load.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./loadtest/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./loadtest/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:${LOAD_GRAFANA_PORT:-3300}:3000"]
+    depends_on: [prometheus]
+
+  postgres-exporter:
+    profiles: [load]
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_URI: postgres:5432/wallet?sslmode=disable
+      DATA_SOURCE_USER: postgres
+      DATA_SOURCE_PASS: postgres
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  promdata:
