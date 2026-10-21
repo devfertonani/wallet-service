@@ -1,0 +1,104 @@
+name: wallet-service
+
+x-wallet: &wallet
+  # Built once by the migrate service; building the same tag from several
+  # services races in BuildKit ("image already exists").
+  image: wallet-service:local
+  pull_policy: never
+  restart: unless-stopped
+  env_file: &env-files
+    - path: .env.example
+    - path: .env
+      required: false
+  environment: &wallet-env
+    DATABASE_URL: postgres://wallet_service:wallet_service@postgres:5432/wallet?sslmode=disable
+    AWS_ENDPOINT_URL: http://ministack:4566
+    OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+    # MiniStack keeps queues in memory: recreate them if it restarts.
+    AWS_AUTO_PROVISION: "true"
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+    provision: { condition: service_completed_successfully }
+    keycloak: { condition: service_healthy }
+  stop_grace_period: 40s
+
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["${POSTGRES_HOST_PORT:-55432}:5432"]
+    volumes:
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ministack:
+    image: ministackorg/ministack:1.5.30
+    ports: ["4566:4566"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      # Fixed public hostname: tokens carry the same "iss" whether they are
+      # requested from the host (localhost:8081) or from inside the network.
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports: ["8081:8080"]
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  migrate:
+    image: wallet-service:local
+    build: .
+    entrypoint: ["/app/migrate", "up"]
+    environment:
+      MIGRATIONS_DATABASE_URL: postgres://wallet_owner:wallet_owner@postgres:5432/wallet?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  provision:
+    image: wallet-service:local
+    pull_policy: never
+    entrypoint: ["/app/provision"]
+    env_file: *env-files
+    environment:
+      AWS_ENDPOINT_URL: http://ministack:4566
+    depends_on:
+      ministack: { condition: service_healthy }
+
+  # Three independent instances, each with its own process, memory and pool.
+  wallet-1:
+    <<: *wallet
+    environment: { <<: *wallet-env, INSTANCE_ID: wallet-1 }
+    ports: ["8091:8080"]
+  wallet-2:
+    <<: *wallet
+    environment: { <<: *wallet-env, INSTANCE_ID: wallet-2 }
+    ports: ["8092:8080"]
+  wallet-3:
+    <<: *wallet
+    environment: { <<: *wallet-env, INSTANCE_ID: wallet-3 }
+    ports: ["8093:8080"]
+
+volumes:
+  pgdata:
